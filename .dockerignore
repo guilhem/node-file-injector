@@ -1,0 +1,11 @@
+# More info: https://docs.docker.com/engine/reference/builder/#dockerignore-file
+# Ignore build artifacts and temporary files
+bin/
+.git/
+.github/
+*.md
+cover.out
+
+# Exclude test files
+**/*_test.go
+**/testdata/
