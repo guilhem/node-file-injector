@@ -63,9 +63,9 @@ var _ = Describe("NodeFileInjector Controller", func() {
 								Key: "test-key",
 							},
 						},
-						Mode:  "0644",
-						Owner: func() *int64 { i := int64(0); return &i }(),
-						Group: func() *int64 { i := int64(0); return &i }(),
+						FileMode: "0644",
+						Owner:    func() *int64 { i := int64(0); return &i }(),
+						Group:    func() *int64 { i := int64(0); return &i }(),
 					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())

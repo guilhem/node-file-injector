@@ -1,4 +1,10 @@
 ## Append samples of your project ##
 resources:
-- files_v1alpha1_nodefileinjector.yaml
+  - files_v1alpha1_nodefileinjector.yaml
+  - files_v1alpha1_nodefileinjector_secret.yaml
+  - files_v1alpha1_nodefileinjector_job.yaml
+  - files_v1alpha1_nodefileinjector_job_simple.yaml
+  - files_v1alpha1_nodefileinjector_job_advanced.yaml
+  - configmap-sample.yaml
+  - secret-sample.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

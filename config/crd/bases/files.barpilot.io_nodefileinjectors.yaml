@@ -54,17 +54,65 @@ spec:
           spec:
             description: spec defines the desired state of NodeFileInjector
             properties:
+              fileMode:
+                default: "0644"
+                description: FileMode is the file mode (permissions) in octal format
+                  (e.g., "0644").
+                pattern: ^0[0-7]{3}$
+                type: string
               group:
                 default: 0
                 description: Group is the group ID that should own the file.
                 format: int64
                 minimum: 0
                 type: integer
+              jobTemplate:
+                description: |-
+                  JobTemplate provides optional configuration for Job-based deployments.
+                  Only applicable when Mode is "job". If not specified, default values are used.
+                  The template allows full customization of Job and Pod specifications including
+                  resources, tolerations, affinity, security context, etc.
+                properties:
+                  activeDeadlineSeconds:
+                    description: |-
+                      ActiveDeadlineSeconds specifies the duration in seconds relative to the startTime
+                      that the job may be active before the system tries to terminate it.
+                    format: int64
+                    type: integer
+                  backoffLimit:
+                    description: |-
+                      BackoffLimit specifies the number of retries before marking this job failed.
+                      If not set, uses the default value from Kubernetes (6).
+                    format: int32
+                    type: integer
+                  template:
+                    description: |-
+                      Template describes the pod that will be created when executing a job.
+                      The controller will merge this template with the required file-injector container.
+                      You can use this to specify resource limits, tolerations, node affinity, etc.
+                    x-kubernetes-preserve-unknown-fields: true
+                  ttlSecondsAfterFinished:
+                    description: |-
+                      TTLSecondsAfterFinished limits the lifetime of a Job that has finished
+                      execution (either Complete or Failed). If this field is set, after the Job finishes,
+                      it is eligible to be automatically deleted. If this field is unset,
+                      the Job won't be automatically deleted.
+                    format: int32
+                    type: integer
+                type: object
               mode:
-                default: "0644"
-                description: Mode is the file mode (permissions) in octal format (e.g.,
-                  "0644").
-                pattern: ^0[0-7]{3}$
+                allOf:
+                - enum:
+                  - daemonset
+                  - job
+                - enum:
+                  - daemonset
+                  - job
+                default: daemonset
+                description: |-
+                  Mode determines how files are deployed to nodes.
+                  - "daemonset": Uses a DaemonSet for continuous monitoring and updates (default)
+                  - "job": Uses Jobs for one-time file injection per node
                 type: string
               nodeSelector:
                 additionalProperties:
@@ -218,8 +266,33 @@ spec:
                 - type
                 x-kubernetes-list-type: map
               daemonSetName:
-                description: DaemonSetName is the name of the managed DaemonSet.
+                description: |-
+                  DaemonSetName is the name of the managed DaemonSet.
+                  Only populated when Mode is "daemonset".
                 type: string
+              nodeStatus:
+                additionalProperties:
+                  description: NodeExecutionStatus represents the status of file injection
+                    on a specific node
+                  properties:
+                    jobName:
+                      description: JobName is the name of the Job managing this node
+                      type: string
+                    lastTransitionTime:
+                      description: LastTransitionTime is the last time the status
+                        transitioned
+                      format: date-time
+                      type: string
+                    status:
+                      description: |-
+                        Status represents the current state of the Job
+                        Possible values: Pending, Running, Succeeded, Failed
+                      type: string
+                  type: object
+                description: |-
+                  NodeStatus tracks the execution status of each node when Mode is "job".
+                  The key is the node name, and the value contains the Job name and status.
+                type: object
               nodesMatched:
                 description: NodesMatched is the number of nodes that match the node
                   selector.

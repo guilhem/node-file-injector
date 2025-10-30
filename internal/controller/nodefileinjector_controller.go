@@ -18,14 +18,14 @@ package controller
 
 import (
 	"context"
-	_ "embed"
 	"fmt"
 
+	"github.com/guilhem/node-file-injector/internal/controller/deployer"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -38,9 +38,6 @@ import (
 	filesv1alpha1 "github.com/guilhem/node-file-injector/api/v1alpha1"
 )
 
-//go:embed scripts/file-injector.sh
-var fileInjectorScript string
-
 const (
 	nodeFileInjectorFinalizer = "files.barpilot.io/finalizer"
 
@@ -48,12 +45,9 @@ const (
 	ConditionReady = "Ready"
 
 	// Condition reasons
-	ReasonSucceeded        = "Succeeded"
-	ReasonFailed           = "Failed"
-	ReasonInvalidSpec      = "InvalidSpec"
-	ReasonDaemonSetCreated = "DaemonSetCreated"
-	ReasonDaemonSetUpdated = "DaemonSetUpdated"
-	ReasonDaemonSetFailed  = "DaemonSetFailed"
+	ReasonSucceeded   = "Succeeded"
+	ReasonFailed      = "Failed"
+	ReasonInvalidSpec = "InvalidSpec"
 )
 
 // NodeFileInjectorReconciler reconciles a NodeFileInjector object
@@ -67,6 +61,7 @@ type NodeFileInjectorReconciler struct {
 // +kubebuilder:rbac:groups=files.barpilot.io,resources=nodefileinjectors/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=files.barpilot.io,resources=nodefileinjectors/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=daemonsets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
@@ -122,26 +117,31 @@ func (r *NodeFileInjectorReconciler) reconcileNormal(ctx context.Context, nfi *f
 		return ctrl.Result{}, nil
 	}
 
-	// Reconcile the DaemonSet
-	daemonSet, err := r.reconcileDaemonSet(ctx, nfi)
+	// Determine deployment mode (default to DaemonSet for backward compatibility)
+	mode := nfi.Spec.Mode
+	if mode == "" {
+		mode = filesv1alpha1.DeploymentModeDaemonSet
+	}
+
+	// Create deployer for the selected mode
+	d := deployer.NewDeployer(mode, r.Client, r.Scheme, r.Recorder)
+
+	// Reconcile using the deployer
+	status, err := d.Reconcile(ctx, nfi)
 	if err != nil {
 		r.setCondition(nfi, ConditionReady, metav1.ConditionFalse, ReasonFailed, err.Error())
 		return ctrl.Result{}, err
 	}
 
-	// Update status
-	nfi.Status.DaemonSetName = daemonSet.Name
+	// Merge status from deployer
+	nfi.Status.NodesMatched = status.NodesMatched
+	nfi.Status.DaemonSetName = status.DaemonSetName
+	nfi.Status.NodeStatus = status.NodeStatuses
 
-	// Count matching nodes
-	var nodeList corev1.NodeList
-	if err := r.List(ctx, &nodeList, client.MatchingLabels(nfi.Spec.NodeSelector)); err != nil {
-		// Ignore error, just don't update count
-	} else {
-		nfi.Status.NodesMatched = int32(len(nodeList.Items))
+	// Merge conditions from deployer
+	for _, condition := range status.Conditions {
+		meta.SetStatusCondition(&nfi.Status.Conditions, condition)
 	}
-
-	// Success
-	r.setCondition(nfi, ConditionReady, metav1.ConditionTrue, ReasonSucceeded, "DaemonSet is ready")
 
 	return ctrl.Result{}, nil
 }
@@ -157,21 +157,19 @@ func (r *NodeFileInjectorReconciler) reconcileDelete(ctx context.Context, nfi *f
 
 	log.Info("Performing cleanup for resource deletion", "name", nfi.Name)
 
-	// Delete the DaemonSet if it exists
-	if nfi.Status.DaemonSetName != "" {
-		daemonSet := &appsv1.DaemonSet{}
-		err := r.Get(ctx, types.NamespacedName{
-			Name:      nfi.Status.DaemonSetName,
-			Namespace: nfi.Namespace,
-		}, daemonSet)
+	// Determine deployment mode
+	mode := nfi.Spec.Mode
+	if mode == "" {
+		mode = filesv1alpha1.DeploymentModeDaemonSet
+	}
 
-		if err == nil {
-			if err := r.Delete(ctx, daemonSet); err != nil && !apierrors.IsNotFound(err) {
-				log.Error(err, "Failed to delete DaemonSet")
-				return ctrl.Result{}, err
-			}
-			log.Info("DaemonSet deleted", "name", daemonSet.Name)
-		}
+	// Create deployer for cleanup
+	d := deployer.NewDeployer(mode, r.Client, r.Scheme, r.Recorder)
+
+	// Delete resources using the deployer
+	if err := d.Delete(ctx, nfi); err != nil {
+		log.Error(err, "Failed to delete resources")
+		return ctrl.Result{}, err
 	}
 
 	// Remove finalizer
@@ -192,232 +190,6 @@ func (r *NodeFileInjectorReconciler) reconcileDelete(ctx context.Context, nfi *f
 
 	log.Info("Successfully completed resource deletion", "name", nfi.Name)
 	return ctrl.Result{}, nil
-}
-
-func (r *NodeFileInjectorReconciler) reconcileDaemonSet(ctx context.Context, nfi *filesv1alpha1.NodeFileInjector) (*appsv1.DaemonSet, error) {
-	log := logf.FromContext(ctx)
-
-	// Build desired DaemonSet
-	desired := r.buildDaemonSet(nfi)
-
-	// Get current DaemonSet
-	current := &appsv1.DaemonSet{}
-	err := r.Get(ctx, types.NamespacedName{
-		Name:      desired.Name,
-		Namespace: desired.Namespace,
-	}, current)
-
-	if err != nil {
-		if !apierrors.IsNotFound(err) {
-			return nil, err
-		}
-
-		// Create DaemonSet
-		if err := controllerutil.SetControllerReference(nfi, desired, r.Scheme); err != nil {
-			return nil, err
-		}
-
-		if err := r.Create(ctx, desired); err != nil {
-			r.Recorder.Event(nfi, corev1.EventTypeWarning, ReasonDaemonSetFailed,
-				fmt.Sprintf("Failed to create DaemonSet: %v", err))
-			return nil, err
-		}
-
-		r.Recorder.Event(nfi, corev1.EventTypeNormal, ReasonDaemonSetCreated,
-			fmt.Sprintf("DaemonSet %s created", desired.Name))
-		log.Info("DaemonSet created", "name", desired.Name)
-		return desired, nil
-	}
-
-	// Update DaemonSet if needed
-	op, err := controllerutil.CreateOrPatch(ctx, r.Client, current, func() error {
-		// Preserve labels and add ours
-		if current.Labels == nil {
-			current.Labels = make(map[string]string)
-		}
-		for k, v := range desired.Labels {
-			current.Labels[k] = v
-		}
-
-		// Update spec
-		current.Spec.Selector = desired.Spec.Selector
-		current.Spec.Template = desired.Spec.Template
-
-		return controllerutil.SetControllerReference(nfi, current, r.Scheme)
-	})
-
-	if err != nil {
-		r.Recorder.Event(nfi, corev1.EventTypeWarning, ReasonDaemonSetFailed,
-			fmt.Sprintf("Failed to update DaemonSet: %v", err))
-		return nil, err
-	}
-
-	switch op {
-	case controllerutil.OperationResultUpdated:
-		r.Recorder.Event(nfi, corev1.EventTypeNormal, ReasonDaemonSetUpdated,
-			fmt.Sprintf("DaemonSet %s updated", current.Name))
-		log.Info("DaemonSet updated", "name", current.Name)
-	}
-
-	return current, nil
-}
-
-func (r *NodeFileInjectorReconciler) buildDaemonSet(nfi *filesv1alpha1.NodeFileInjector) *appsv1.DaemonSet {
-	labels := map[string]string{
-		"app.kubernetes.io/name":       "node-file-injector",
-		"app.kubernetes.io/instance":   nfi.Name,
-		"app.kubernetes.io/managed-by": "node-file-injector-controller",
-	}
-
-	// Build volume and volumeMount based on source
-	var volumes []corev1.Volume
-	var volumeMounts []corev1.VolumeMount
-	var envVars []corev1.EnvVar
-
-	if nfi.Spec.Source.ConfigMapKeyRef != nil {
-		volumes = append(volumes, corev1.Volume{
-			Name: "source",
-			VolumeSource: corev1.VolumeSource{
-				ConfigMap: &corev1.ConfigMapVolumeSource{
-					LocalObjectReference: corev1.LocalObjectReference{
-						Name: nfi.Spec.Source.ConfigMapKeyRef.Name,
-					},
-					Items: []corev1.KeyToPath{
-						{
-							Key:  nfi.Spec.Source.ConfigMapKeyRef.Key,
-							Path: "content",
-						},
-					},
-				},
-			},
-		})
-		envVars = append(envVars, corev1.EnvVar{
-			Name:  "SOURCE_TYPE",
-			Value: "configmap",
-		})
-	} else if nfi.Spec.Source.SecretKeyRef != nil {
-		volumes = append(volumes, corev1.Volume{
-			Name: "source",
-			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{
-					SecretName: nfi.Spec.Source.SecretKeyRef.Name,
-					Items: []corev1.KeyToPath{
-						{
-							Key:  nfi.Spec.Source.SecretKeyRef.Key,
-							Path: "content",
-						},
-					},
-				},
-			},
-		})
-		envVars = append(envVars, corev1.EnvVar{
-			Name:  "SOURCE_TYPE",
-			Value: "secret",
-		})
-	}
-
-	volumeMounts = append(volumeMounts, corev1.VolumeMount{
-		Name:      "source",
-		MountPath: "/source",
-		ReadOnly:  true,
-	})
-
-	// Add host path volume for the destination
-	volumes = append(volumes, corev1.Volume{
-		Name: "host",
-		VolumeSource: corev1.VolumeSource{
-			HostPath: &corev1.HostPathVolumeSource{
-				Path: "/",
-			},
-		},
-	})
-
-	volumeMounts = append(volumeMounts, corev1.VolumeMount{
-		Name:      "host",
-		MountPath: "/host",
-	})
-
-	// Set default mode if not specified
-	mode := nfi.Spec.Mode
-	if mode == "" {
-		mode = "0644"
-	}
-
-	// Set default owner/group if not specified
-	owner := int64(0)
-	if nfi.Spec.Owner != nil {
-		owner = *nfi.Spec.Owner
-	}
-	group := int64(0)
-	if nfi.Spec.Group != nil {
-		group = *nfi.Spec.Group
-	}
-
-	// Environment variables for the injector
-	envVars = append(envVars,
-		corev1.EnvVar{Name: "TARGET_PATH", Value: nfi.Spec.Path},
-		corev1.EnvVar{Name: "FILE_MODE", Value: mode},
-		corev1.EnvVar{Name: "FILE_OWNER", Value: fmt.Sprintf("%d", owner)},
-		corev1.EnvVar{Name: "FILE_GROUP", Value: fmt.Sprintf("%d", group)},
-	)
-
-	// Build the DaemonSet
-	privileged := true
-	runAsUser := int64(0)
-
-	ds := &appsv1.DaemonSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("nfi-%s", nfi.Name),
-			Namespace: nfi.Namespace,
-			Labels:    labels,
-		},
-		Spec: appsv1.DaemonSetSpec{
-			Selector: &metav1.LabelSelector{
-				MatchLabels: labels,
-			},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: labels,
-				},
-				Spec: corev1.PodSpec{
-					NodeSelector: nfi.Spec.NodeSelector,
-					Containers: []corev1.Container{
-						{
-							Name:  "file-injector",
-							Image: "busybox:latest",
-							Command: []string{
-								"sh",
-								"-c",
-								fileInjectorScript,
-							},
-							Env:          envVars,
-							VolumeMounts: volumeMounts,
-							SecurityContext: &corev1.SecurityContext{
-								Privileged: &privileged,
-								RunAsUser:  &runAsUser,
-							},
-							Resources: corev1.ResourceRequirements{
-								Requests: corev1.ResourceList{
-									corev1.ResourceCPU:    resource.MustParse("10m"),
-									corev1.ResourceMemory: resource.MustParse("32Mi"),
-								},
-								Limits: corev1.ResourceList{
-									corev1.ResourceCPU:    resource.MustParse("100m"),
-									corev1.ResourceMemory: resource.MustParse("64Mi"),
-								},
-							},
-						},
-					},
-					Volumes:            volumes,
-					HostNetwork:        false,
-					HostPID:            false,
-					ServiceAccountName: "default",
-				},
-			},
-		},
-	}
-
-	return ds
 }
 
 func (r *NodeFileInjectorReconciler) setCondition(nfi *filesv1alpha1.NodeFileInjector, conditionType string, status metav1.ConditionStatus, reason, message string) {
@@ -441,7 +213,10 @@ func (r *NodeFileInjectorReconciler) updateResourceStatus(ctx context.Context, n
 		Name:      nfi.Name,
 		Namespace: nfi.Namespace,
 	}, &latestNFI); err != nil {
-		log.Error(err, "Failed to get latest resource for status update")
+		// Ignore NotFound errors - resource was deleted
+		if !apierrors.IsNotFound(err) {
+			log.Error(err, "Failed to get latest resource for status update")
+		}
 		return
 	}
 
@@ -449,7 +224,10 @@ func (r *NodeFileInjectorReconciler) updateResourceStatus(ctx context.Context, n
 	latestNFI.Status = nfi.Status
 
 	if err := r.Status().Update(ctx, &latestNFI); err != nil {
-		log.Error(err, "Failed to update status")
+		// Ignore NotFound and Conflict errors - expected during concurrent updates/deletion
+		if !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
+			log.Error(err, "Failed to update status")
+		}
 	}
 }
 
@@ -458,6 +236,7 @@ func (r *NodeFileInjectorReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&filesv1alpha1.NodeFileInjector{}).
 		Owns(&appsv1.DaemonSet{}).
+		Owns(&batchv1.Job{}).
 		Named("nodefileinjector").
 		Complete(r)
 }

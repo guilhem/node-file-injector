@@ -46,7 +46,7 @@ const metricsServiceName = "node-file-injector-controller-manager-metrics-servic
 // metricsRoleBindingName is the name of the RBAC that will be created to allow get the metrics data
 const metricsRoleBindingName = "node-file-injector-metrics-binding"
 
-var _ = Describe("Manager", Ordered, func() {
+var _ = Describe("1. Manager", Serial, Ordered, func() {
 	var controllerPodName string
 
 	// Before running the tests, set up the environment by creating the namespace,
@@ -248,11 +248,783 @@ var _ = Describe("Manager", Ordered, func() {
 
 		// +kubebuilder:scaffold:e2e-webhooks-checks
 	})
-})
 
-var _ = Describe("NodeFileInjector File Injection", Ordered, func() {
-	const testNamespace = "default"
+	Context("NodeFileInjector File Injection", Ordered, func() {
+		const testNamespace = "default"
 
+		Context("ConfigMap-based file injection", func() {
+			const (
+				nfiName    = "test-cm-injection"
+				configMap  = "test-nfi-cm"
+				targetPath = "/tmp/test-nfi-cm/config.yaml"
+			)
+
+			BeforeAll(func() {
+				By("creating test ConfigMap")
+				cmd := exec.Command("kubectl", "create", "configmap", configMap,
+					"--from-literal=config.yaml=initial-content-v1",
+					"-n", testNamespace)
+				_, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			AfterAll(func() {
+				By("cleaning up NodeFileInjector")
+				cmd := exec.Command("kubectl", "delete", "nfi", nfiName,
+					"-n", testNamespace, "--ignore-not-found=true")
+				_, _ = utils.Run(cmd)
+
+				By("cleaning up ConfigMap")
+				cmd = exec.Command("kubectl", "delete", "configmap", configMap,
+					"-n", testNamespace, "--ignore-not-found=true")
+				_, _ = utils.Run(cmd)
+			})
+
+			It("should inject file from ConfigMap to node", func() {
+				By("creating NodeFileInjector resource")
+				nfiYaml := fmt.Sprintf(`
+apiVersion: files.barpilot.io/v1alpha1
+kind: NodeFileInjector
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  path: %s
+  source:
+    configMapKeyRef:
+      name: %s
+      key: config.yaml
+  fileMode: "0644"
+  owner: 0
+  group: 0
+`, nfiName, testNamespace, targetPath, configMap)
+
+				cmd := exec.Command("kubectl", "apply", "-f", "-")
+				cmd.Stdin = strings.NewReader(nfiYaml)
+				_, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+
+				By("waiting for DaemonSet to be created")
+				Eventually(func(g Gomega) {
+					cmd := exec.Command("kubectl", "get", "daemonset",
+						fmt.Sprintf("nfi-%s", nfiName),
+						"-n", testNamespace,
+						"-o", "jsonpath={.metadata.name}")
+					output, err := utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(output).To(Equal(fmt.Sprintf("nfi-%s", nfiName)))
+				}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+				By("waiting for DaemonSet pod to be running")
+				var podName string
+				Eventually(func(g Gomega) {
+					cmd := exec.Command("kubectl", "get", "pods",
+						"-l", fmt.Sprintf("app.kubernetes.io/instance=%s", nfiName),
+						"-n", testNamespace,
+						"-o", "jsonpath={.items[0].metadata.name}")
+					output, err := utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(output).NotTo(BeEmpty())
+					podName = strings.TrimSpace(output)
+				}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+				Eventually(func(g Gomega) {
+					cmd := exec.Command("kubectl", "get", "pod", podName,
+						"-n", testNamespace,
+						"-o", "jsonpath={.status.phase}")
+					output, err := utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(strings.TrimSpace(output)).To(Equal("Running"))
+				}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+				By("verifying file content on the node")
+				Eventually(func(g Gomega) {
+					cmd := exec.Command("kubectl", "exec", podName,
+						"-c", "file-injector",
+						"-n", testNamespace,
+						"--",
+						"cat", fmt.Sprintf("/host%s", targetPath))
+					output, err := utils.Run(cmd)
+					if err != nil {
+						// Debug logs on failure
+						logCmd := exec.Command("kubectl", "logs", podName, "-c", "file-injector", "-n", testNamespace, "--tail=50")
+						if logs, logErr := utils.Run(logCmd); logErr == nil {
+							fmt.Printf("\n=== Pod logs (last 50 lines) ===\n%s\n", logs)
+						}
+					}
+					g.Expect(err).NotTo(HaveOccurred())
+					if strings.TrimSpace(output) != "initial-content-v1" {
+						fmt.Printf("\n=== Unexpected file content ===\nExpected: 'initial-content-v1'\nGot: '%s'\n", strings.TrimSpace(output))
+					}
+					g.Expect(strings.TrimSpace(output)).To(Equal("initial-content-v1"))
+				}, 1*time.Minute, 5*time.Second).Should(Succeed())
+
+				By("verifying file permissions (0644)")
+				cmd = exec.Command("kubectl", "exec", podName,
+					"-c", "file-injector",
+					"-n", testNamespace,
+					"--",
+					"stat", "-c", "%a", fmt.Sprintf("/host%s", targetPath))
+				output, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(strings.TrimSpace(output)).To(Equal("644"))
+
+				By("verifying file ownership (0:0)")
+				cmd = exec.Command("kubectl", "exec", podName,
+					"-c", "file-injector",
+					"-n", testNamespace,
+					"--",
+					"stat", "-c", "%u:%g", fmt.Sprintf("/host%s", targetPath))
+				output, err = utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(strings.TrimSpace(output)).To(Equal("0:0"))
+
+				By("verifying NodeFileInjector status is Ready")
+				Eventually(func(g Gomega) {
+					cmd := exec.Command("kubectl", "get", "nfi", nfiName,
+						"-n", testNamespace,
+						"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
+					output, err := utils.Run(cmd)
+					if err != nil {
+						// Debug: show full NFI status
+						statusCmd := exec.Command("kubectl", "get", "nfi", nfiName, "-n", testNamespace, "-o", "yaml")
+						if statusYaml, statusErr := utils.Run(statusCmd); statusErr == nil {
+							fmt.Printf("\n=== NodeFileInjector status ===\n%s\n", statusYaml)
+						}
+					}
+					g.Expect(err).NotTo(HaveOccurred())
+					if strings.TrimSpace(output) != "True" {
+						fmt.Printf("\n=== NodeFileInjector not Ready ===\nStatus: '%s'\n", strings.TrimSpace(output))
+						// Show conditions
+						condCmd := exec.Command("kubectl", "get", "nfi", nfiName, "-n", testNamespace, "-o", "jsonpath={.status.conditions}")
+						if conditions, condErr := utils.Run(condCmd); condErr == nil {
+							fmt.Printf("Conditions: %s\n", conditions)
+						}
+					}
+					g.Expect(strings.TrimSpace(output)).To(Equal("True"))
+				}, 2*time.Minute, 5*time.Second).Should(Succeed())
+			})
+
+			It("should update file when ConfigMap changes", func() {
+				By("getting the current pod name")
+				cmd := exec.Command("kubectl", "get", "pods",
+					"-l", fmt.Sprintf("app.kubernetes.io/instance=%s", nfiName),
+					"-n", testNamespace,
+					"-o", "jsonpath={.items[0].metadata.name}")
+				podName, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+				podName = strings.TrimSpace(podName)
+				Expect(podName).NotTo(BeEmpty())
+
+				By("updating ConfigMap content")
+				cmd = exec.Command("kubectl", "patch", "configmap", configMap,
+					"-n", testNamespace,
+					"--type=json",
+					"-p", `[{"op": "replace", "path": "/data/config.yaml", "value": "updated-content-v2"}]`)
+				_, err = utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+
+				By("waiting for file content to be updated (Kubernetes ConfigMap sync + script check)")
+				Eventually(func(g Gomega) {
+					cmd := exec.Command("kubectl", "exec", podName,
+						"-c", "file-injector",
+						"-n", testNamespace,
+						"--",
+						"cat", fmt.Sprintf("/host%s", targetPath))
+					output, err := utils.Run(cmd)
+					if err != nil {
+						// Debug logs
+						logCmd := exec.Command("kubectl", "logs", podName, "-c", "file-injector", "-n", testNamespace, "--tail=100")
+						if logs, logErr := utils.Run(logCmd); logErr == nil {
+							fmt.Printf("\n=== Pod logs (last 100 lines) ===\n%s\n", logs)
+						}
+						// Check ConfigMap content
+						cmCmd := exec.Command("kubectl", "get", "configmap", "test-nfi-cm", "-n", testNamespace, "-o", "yaml")
+						if cmYaml, cmErr := utils.Run(cmCmd); cmErr == nil {
+							fmt.Printf("\n=== ConfigMap content ===\n%s\n", cmYaml)
+						}
+					}
+					g.Expect(err).NotTo(HaveOccurred())
+					currentContent := strings.TrimSpace(output)
+					if currentContent != "updated-content-v2" {
+						fmt.Printf("\n=== File not yet updated ===\nExpected: 'updated-content-v2'\nGot: '%s'\n", currentContent)
+						// Check mounted volume content
+						srcCmd := exec.Command("kubectl", "exec", podName, "-c", "file-injector", "-n", testNamespace, "--", "cat", "/source/content")
+						if srcContent, srcErr := utils.Run(srcCmd); srcErr == nil {
+							fmt.Printf("Source volume content: '%s'\n", strings.TrimSpace(srcContent))
+						}
+					}
+					g.Expect(currentContent).To(Equal("updated-content-v2"))
+				}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+				By("verifying backup file was created")
+				cmd = exec.Command("kubectl", "exec", podName,
+					"-c", "file-injector",
+					"-n", testNamespace,
+					"--",
+					"sh", "-c", fmt.Sprintf("ls %s.backup.* 2>/dev/null | wc -l", fmt.Sprintf("/host%s", targetPath)))
+				output, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+				backupCount := strings.TrimSpace(output)
+				Expect(backupCount).NotTo(Equal("0"), "At least one backup file should exist")
+			})
+		})
+
+		Context("Secret-based file injection", func() {
+			const (
+				nfiName    = "test-secret-injection"
+				secretName = "test-nfi-secret"
+				targetPath = "/tmp/test-nfi-secret/token"
+			)
+
+			BeforeAll(func() {
+				By("creating test Secret")
+				cmd := exec.Command("kubectl", "create", "secret", "generic", secretName,
+					"--from-literal=token=secret-token-value",
+					"-n", testNamespace)
+				_, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			AfterAll(func() {
+				By("cleaning up NodeFileInjector")
+				cmd := exec.Command("kubectl", "delete", "nfi", nfiName,
+					"-n", testNamespace, "--ignore-not-found=true")
+				_, _ = utils.Run(cmd)
+
+				By("cleaning up Secret")
+				cmd = exec.Command("kubectl", "delete", "secret", secretName,
+					"-n", testNamespace, "--ignore-not-found=true")
+				_, _ = utils.Run(cmd)
+			})
+
+			It("should inject file from Secret with restricted permissions", func() {
+				By("creating NodeFileInjector resource with Secret source")
+				nfiYaml := fmt.Sprintf(`
+apiVersion: files.barpilot.io/v1alpha1
+kind: NodeFileInjector
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  path: %s
+  source:
+    secretKeyRef:
+      name: %s
+      key: token
+  fileMode: "0600"
+  owner: 1000
+  group: 1000
+`, nfiName, testNamespace, targetPath, secretName)
+
+				cmd := exec.Command("kubectl", "apply", "-f", "-")
+				cmd.Stdin = strings.NewReader(nfiYaml)
+				_, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+
+				By("waiting for DaemonSet pod to be running")
+				var podName string
+				Eventually(func(g Gomega) {
+					cmd := exec.Command("kubectl", "get", "pods",
+						"-l", fmt.Sprintf("app.kubernetes.io/instance=%s", nfiName),
+						"-n", testNamespace,
+						"-o", "jsonpath={.items[0].metadata.name}")
+					output, err := utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred())
+					podName = strings.TrimSpace(output)
+					g.Expect(podName).NotTo(BeEmpty())
+				}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+				Eventually(func(g Gomega) {
+					cmd := exec.Command("kubectl", "get", "pod", podName,
+						"-n", testNamespace,
+						"-o", "jsonpath={.status.phase}")
+					output, err := utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(strings.TrimSpace(output)).To(Equal("Running"))
+				}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+				By("verifying file was created with correct content")
+				Eventually(func(g Gomega) {
+					cmd := exec.Command("kubectl", "exec", podName,
+						"-c", "file-injector",
+						"-n", testNamespace,
+						"--",
+						"test", "-f", fmt.Sprintf("/host%s", targetPath))
+					_, err := utils.Run(cmd)
+					if err != nil {
+						// Debug logs
+						logCmd := exec.Command("kubectl", "logs", podName, "-c", "file-injector", "-n", testNamespace, "--tail=50")
+						if logs, logErr := utils.Run(logCmd); logErr == nil {
+							fmt.Printf("\n=== Pod logs (last 50 lines) ===\n%s\n", logs)
+						}
+						// Check directory content
+						lsCmd := exec.Command("kubectl", "exec", podName, "-c", "file-injector", "-n", testNamespace, "--", "ls", "-la", "/host/tmp/test-nfi-secret")
+						if lsOutput, lsErr := utils.Run(lsCmd); lsErr == nil {
+							fmt.Printf("\n=== Directory content ===\n%s\n", lsOutput)
+						}
+					}
+					g.Expect(err).NotTo(HaveOccurred())
+				}, 1*time.Minute, 5*time.Second).Should(Succeed())
+
+				By("verifying restrictive file permissions (0600)")
+				cmd = exec.Command("kubectl", "exec", podName,
+					"-c", "file-injector",
+					"-n", testNamespace,
+					"--",
+					"stat", "-c", "%a", fmt.Sprintf("/host%s", targetPath))
+				output, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(strings.TrimSpace(output)).To(Equal("600"))
+
+				By("verifying file ownership (1000:1000)")
+				cmd = exec.Command("kubectl", "exec", podName,
+					"-c", "file-injector",
+					"-n", testNamespace,
+					"--",
+					"stat", "-c", "%u:%g", fmt.Sprintf("/host%s", targetPath))
+				output, err = utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(strings.TrimSpace(output)).To(Equal("1000:1000"))
+			})
+		})
+	})
+
+	Context("NodeFileInjector Job Mode", Ordered, func() {
+		const testNamespace = "default"
+
+		Context("Job mode basic file injection", func() {
+			const (
+				nfiName    = "test-job-basic"
+				configMap  = "test-job-cm"
+				targetPath = "/tmp/test-job-basic/config.yaml"
+			)
+
+			BeforeAll(func() {
+				By("creating test ConfigMap")
+				cmd := exec.Command("kubectl", "create", "configmap", configMap,
+					"--from-literal=config.yaml=job-content-v1",
+					"-n", testNamespace)
+				_, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			AfterAll(func() {
+				By("cleaning up NodeFileInjector")
+				cmd := exec.Command("kubectl", "delete", "nfi", nfiName,
+					"-n", testNamespace, "--ignore-not-found=true")
+				_, _ = utils.Run(cmd)
+
+				By("cleaning up ConfigMap")
+				cmd = exec.Command("kubectl", "delete", "configmap", configMap,
+					"-n", testNamespace, "--ignore-not-found=true")
+				_, _ = utils.Run(cmd)
+			})
+
+			It("should inject file using Job mode", func() {
+				By("creating NodeFileInjector resource with Job mode")
+				nfiYaml := fmt.Sprintf(`
+apiVersion: files.barpilot.io/v1alpha1
+kind: NodeFileInjector
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  mode: job
+  jobTemplate:
+    ttlSecondsAfterFinished: 300
+  path: %s
+  source:
+    configMapKeyRef:
+      name: %s
+      key: config.yaml
+  fileMode: "0644"
+  owner: 0
+  group: 0
+`, nfiName, testNamespace, targetPath, configMap)
+
+				cmd := exec.Command("kubectl", "apply", "-f", "-")
+				cmd.Stdin = strings.NewReader(nfiYaml)
+				_, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+
+				By("waiting for Job to be created")
+				var jobName string
+				Eventually(func(g Gomega) {
+					cmd := exec.Command("kubectl", "get", "jobs",
+						"-l", fmt.Sprintf("files.barpilot.io/nfi-name=%s", nfiName),
+						"-n", testNamespace,
+						"-o", "jsonpath={.items[0].metadata.name}")
+					output, err := utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred())
+					jobName = strings.TrimSpace(output)
+					g.Expect(jobName).NotTo(BeEmpty())
+				}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+				By("waiting for Job to complete")
+				Eventually(func(g Gomega) {
+					cmd := exec.Command("kubectl", "get", "job", jobName,
+						"-n", testNamespace,
+						"-o", "jsonpath={.status.conditions[?(@.type=='Complete')].status}")
+					output, err := utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(strings.TrimSpace(output)).To(Equal("True"))
+				}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+				By("verifying the Job completed successfully")
+				// Note: For Job mode, the pod exits after completion, so we can't exec into it
+				// We verify success through the Job status and NodeFileInjector status instead
+				cmd = exec.Command("kubectl", "get", "job", jobName,
+					"-n", testNamespace,
+					"-o", "jsonpath={.status.succeeded}")
+				jobOutput, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(strings.TrimSpace(jobOutput)).To(Equal("1"))
+
+				By("verifying NodeFileInjector status is Ready")
+				Eventually(func(g Gomega) {
+					cmd := exec.Command("kubectl", "get", "nfi", nfiName,
+						"-n", testNamespace,
+						"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
+					statusOutput, err := utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(strings.TrimSpace(statusOutput)).To(Equal("True"))
+				}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+				By("verifying nodeStatus is populated")
+				cmd = exec.Command("kubectl", "get", "nfi", nfiName,
+					"-n", testNamespace,
+					"-o", "jsonpath={.status.nodeStatus}")
+				nodeStatusOutput, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(nodeStatusOutput).To(ContainSubstring("Succeeded"))
+			})
+		})
+
+		Context("Job mode with custom resources", func() {
+			const (
+				nfiName    = "test-job-resources"
+				configMap  = "test-job-resources-cm"
+				targetPath = "/tmp/test-job-resources/config.yaml"
+			)
+
+			BeforeAll(func() {
+				By("creating test ConfigMap")
+				cmd := exec.Command("kubectl", "create", "configmap", configMap,
+					"--from-literal=config.yaml=resource-test",
+					"-n", testNamespace)
+				_, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			AfterAll(func() {
+				By("cleaning up NodeFileInjector")
+				cmd := exec.Command("kubectl", "delete", "nfi", nfiName,
+					"-n", testNamespace, "--ignore-not-found=true")
+				_, _ = utils.Run(cmd)
+
+				By("cleaning up ConfigMap")
+				cmd = exec.Command("kubectl", "delete", "configmap", configMap,
+					"-n", testNamespace, "--ignore-not-found=true")
+				_, _ = utils.Run(cmd)
+			})
+
+			It("should use custom resources from template", func() {
+				By("creating NodeFileInjector with custom resource limits")
+				nfiYaml := fmt.Sprintf(`
+apiVersion: files.barpilot.io/v1alpha1
+kind: NodeFileInjector
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  mode: job
+  jobTemplate:
+    ttlSecondsAfterFinished: 300
+    template:
+      spec:
+        containers:
+        - name: file-injector
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+  path: %s
+  source:
+    configMapKeyRef:
+      name: %s
+      key: config.yaml
+  fileMode: "0644"
+`, nfiName, testNamespace, targetPath, configMap)
+
+				cmd := exec.Command("kubectl", "apply", "-f", "-")
+				cmd.Stdin = strings.NewReader(nfiYaml)
+				_, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+
+				By("waiting for Job to be created")
+				var jobName string
+				Eventually(func(g Gomega) {
+					cmd := exec.Command("kubectl", "get", "jobs",
+						"-l", fmt.Sprintf("files.barpilot.io/nfi-name=%s", nfiName),
+						"-n", testNamespace,
+						"-o", "jsonpath={.items[0].metadata.name}")
+					output, err := utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred())
+					jobName = strings.TrimSpace(output)
+					g.Expect(jobName).NotTo(BeEmpty())
+				}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+				By("verifying Job has custom resource limits")
+				cmd = exec.Command("kubectl", "get", "job", jobName,
+					"-n", testNamespace,
+					"-o", "jsonpath={.spec.template.spec.containers[0].resources.limits.memory}")
+				output, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(strings.TrimSpace(output)).To(Equal("128Mi"))
+
+				By("waiting for Job to complete")
+				Eventually(func(g Gomega) {
+					cmd := exec.Command("kubectl", "get", "job", jobName,
+						"-n", testNamespace,
+						"-o", "jsonpath={.status.conditions[?(@.type=='Complete')].status}")
+					output, err := utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(strings.TrimSpace(output)).To(Equal("True"))
+				}, 2*time.Minute, 5*time.Second).Should(Succeed())
+			})
+		})
+
+		Context("Job mode with tolerations", func() {
+			const (
+				nfiName    = "test-job-tolerations"
+				configMap  = "test-job-tolerations-cm"
+				targetPath = "/tmp/test-job-tolerations/config.yaml"
+			)
+
+			BeforeAll(func() {
+				By("creating test ConfigMap")
+				cmd := exec.Command("kubectl", "create", "configmap", configMap,
+					"--from-literal=config.yaml=toleration-test",
+					"-n", testNamespace)
+				_, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			AfterAll(func() {
+				By("cleaning up NodeFileInjector")
+				cmd := exec.Command("kubectl", "delete", "nfi", nfiName,
+					"-n", testNamespace, "--ignore-not-found=true")
+				_, _ = utils.Run(cmd)
+
+				By("cleaning up ConfigMap")
+				cmd = exec.Command("kubectl", "delete", "configmap", configMap,
+					"-n", testNamespace, "--ignore-not-found=true")
+				_, _ = utils.Run(cmd)
+			})
+
+			It("should apply tolerations from template", func() {
+				By("creating NodeFileInjector with tolerations")
+				nfiYaml := fmt.Sprintf(`
+apiVersion: files.barpilot.io/v1alpha1
+kind: NodeFileInjector
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  mode: job
+  jobTemplate:
+    ttlSecondsAfterFinished: 300
+    template:
+      apiVersion: v1
+      kind: PodTemplateSpec
+      spec:
+        tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+  path: %s
+  source:
+    configMapKeyRef:
+      name: %s
+      key: config.yaml
+  fileMode: "0644"
+`, nfiName, testNamespace, targetPath, configMap)
+
+				cmd := exec.Command("kubectl", "apply", "-f", "-")
+				cmd.Stdin = strings.NewReader(nfiYaml)
+				_, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+
+				By("waiting for Job to be created")
+				var jobName string
+				Eventually(func(g Gomega) {
+					cmd := exec.Command("kubectl", "get", "jobs",
+						"-l", fmt.Sprintf("files.barpilot.io/nfi-name=%s", nfiName),
+						"-n", testNamespace,
+						"-o", "jsonpath={.items[0].metadata.name}")
+					output, err := utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred())
+					jobName = strings.TrimSpace(output)
+					g.Expect(jobName).NotTo(BeEmpty())
+				}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+				By("verifying Job has toleration")
+				cmd = exec.Command("kubectl", "get", "job", jobName,
+					"-n", testNamespace,
+					"-o", "jsonpath={.spec.template.spec.tolerations[0].key}")
+				output, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(strings.TrimSpace(output)).To(Equal("node-role.kubernetes.io/control-plane"))
+
+				By("waiting for Job to complete")
+				Eventually(func(g Gomega) {
+					cmd := exec.Command("kubectl", "get", "job", jobName,
+						"-n", testNamespace,
+						"-o", "jsonpath={.status.conditions[?(@.type=='Complete')].status}")
+					output, err := utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(strings.TrimSpace(output)).To(Equal("True"))
+				}, 2*time.Minute, 5*time.Second).Should(Succeed())
+			})
+		})
+
+		Context("Job mode with generation change", func() {
+			const (
+				nfiName    = "test-job-generation"
+				configMap  = "test-job-generation-cm"
+				targetPath = "/tmp/test-job-generation/config.yaml"
+			)
+
+			BeforeAll(func() {
+				By("creating test ConfigMap")
+				cmd := exec.Command("kubectl", "create", "configmap", configMap,
+					"--from-literal=config.yaml=generation-v1",
+					"-n", testNamespace)
+				_, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			AfterAll(func() {
+				By("cleaning up NodeFileInjector")
+				cmd := exec.Command("kubectl", "delete", "nfi", nfiName,
+					"-n", testNamespace, "--ignore-not-found=true")
+				_, _ = utils.Run(cmd)
+
+				By("cleaning up ConfigMap")
+				cmd = exec.Command("kubectl", "delete", "configmap", configMap,
+					"-n", testNamespace, "--ignore-not-found=true")
+				_, _ = utils.Run(cmd)
+			})
+
+			It("should recreate Job when spec changes", func() {
+				By("creating initial NodeFileInjector")
+				nfiYaml := fmt.Sprintf(`
+apiVersion: files.barpilot.io/v1alpha1
+kind: NodeFileInjector
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  mode: job
+  jobTemplate:
+    ttlSecondsAfterFinished: 300
+  path: %s
+  source:
+    configMapKeyRef:
+      name: %s
+      key: config.yaml
+  fileMode: "0644"
+`, nfiName, testNamespace, targetPath, configMap)
+
+				cmd := exec.Command("kubectl", "apply", "-f", "-")
+				cmd.Stdin = strings.NewReader(nfiYaml)
+				_, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+
+				By("waiting for first Job to complete")
+				var firstJobName string
+				Eventually(func(g Gomega) {
+					cmd := exec.Command("kubectl", "get", "jobs",
+						"-l", fmt.Sprintf("files.barpilot.io/nfi-name=%s", nfiName),
+						"-n", testNamespace,
+						"-o", "jsonpath={.items[0].metadata.name}")
+					output, err := utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred())
+					firstJobName = strings.TrimSpace(output)
+					g.Expect(firstJobName).NotTo(BeEmpty())
+				}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+				Eventually(func(g Gomega) {
+					cmd := exec.Command("kubectl", "get", "job", firstJobName,
+						"-n", testNamespace,
+						"-o", "jsonpath={.status.conditions[?(@.type=='Complete')].status}")
+					output, err := utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(strings.TrimSpace(output)).To(Equal("True"))
+				}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+				By("updating ConfigMap content to trigger generation change")
+				cmd = exec.Command("kubectl", "patch", "configmap", configMap,
+					"-n", testNamespace,
+					"--type=json",
+					"-p", `[{"op": "replace", "path": "/data/config.yaml", "value": "generation-v2"}]`)
+				_, err = utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+
+				By("updating NodeFileInjector to change file mode (triggers generation change)")
+				nfiYaml = fmt.Sprintf(`
+apiVersion: files.barpilot.io/v1alpha1
+kind: NodeFileInjector
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  mode: job
+  jobTemplate:
+    ttlSecondsAfterFinished: 300
+  path: %s
+  source:
+    configMapKeyRef:
+      name: %s
+      key: config.yaml
+  fileMode: "0600"
+`, nfiName, testNamespace, targetPath, configMap)
+
+				cmd = exec.Command("kubectl", "apply", "-f", "-")
+				cmd.Stdin = strings.NewReader(nfiYaml)
+				_, err = utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred())
+
+				By("waiting for new Job to be created")
+				Eventually(func(g Gomega) {
+					cmd := exec.Command("kubectl", "get", "jobs",
+						"-l", fmt.Sprintf("files.barpilot.io/nfi-name=%s", nfiName),
+						"-n", testNamespace,
+						"-o", "jsonpath={.items[*].metadata.name}")
+					output, err := utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred())
+					// Should have at least 2 jobs (old might be deleted due to TTL)
+					g.Expect(output).NotTo(Equal(firstJobName))
+				}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+				By("verifying NodeFileInjector status reflects new execution")
+				Eventually(func(g Gomega) {
+					cmd := exec.Command("kubectl", "get", "nfi", nfiName,
+						"-n", testNamespace,
+						"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
+					output, err := utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(strings.TrimSpace(output)).To(Equal("True"))
+				}, 2*time.Minute, 5*time.Second).Should(Succeed())
+			})
+		})
+	})
+
+	// Cleanup after all tests complete
 	AfterAll(func() {
 		By("cleaning up the curl pod for metrics")
 		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
@@ -269,343 +1041,6 @@ var _ = Describe("NodeFileInjector File Injection", Ordered, func() {
 		By("removing manager namespace")
 		cmd = exec.Command("kubectl", "delete", "ns", namespace)
 		_, _ = utils.Run(cmd)
-	})
-
-	Context("ConfigMap-based file injection", func() {
-		const (
-			nfiName    = "test-cm-injection"
-			configMap  = "test-nfi-cm"
-			targetPath = "/tmp/test-nfi-cm/config.yaml"
-		)
-
-		BeforeAll(func() {
-			By("creating test ConfigMap")
-			cmd := exec.Command("kubectl", "create", "configmap", configMap,
-				"--from-literal=config.yaml=initial-content-v1",
-				"-n", testNamespace)
-			_, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-		})
-
-		AfterAll(func() {
-			By("cleaning up NodeFileInjector")
-			cmd := exec.Command("kubectl", "delete", "nfi", nfiName,
-				"-n", testNamespace, "--ignore-not-found=true")
-			_, _ = utils.Run(cmd)
-
-			By("cleaning up ConfigMap")
-			cmd = exec.Command("kubectl", "delete", "configmap", configMap,
-				"-n", testNamespace, "--ignore-not-found=true")
-			_, _ = utils.Run(cmd)
-		})
-
-		It("should inject file from ConfigMap to node", func() {
-			By("creating NodeFileInjector resource")
-			nfiYaml := fmt.Sprintf(`
-apiVersion: files.barpilot.io/v1alpha1
-kind: NodeFileInjector
-metadata:
-  name: %s
-  namespace: %s
-spec:
-  path: %s
-  source:
-    configMapKeyRef:
-      name: %s
-      key: config.yaml
-  mode: "0644"
-  owner: 0
-  group: 0
-`, nfiName, testNamespace, targetPath, configMap)
-
-			cmd := exec.Command("kubectl", "apply", "-f", "-")
-			cmd.Stdin = strings.NewReader(nfiYaml)
-			_, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("waiting for DaemonSet to be created")
-			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "daemonset",
-					fmt.Sprintf("nfi-%s", nfiName),
-					"-n", testNamespace,
-					"-o", "jsonpath={.metadata.name}")
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal(fmt.Sprintf("nfi-%s", nfiName)))
-			}, 2*time.Minute, 5*time.Second).Should(Succeed())
-
-			By("waiting for DaemonSet pod to be running")
-			var podName string
-			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "pods",
-					"-l", fmt.Sprintf("app.kubernetes.io/instance=%s", nfiName),
-					"-n", testNamespace,
-					"-o", "jsonpath={.items[0].metadata.name}")
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).NotTo(BeEmpty())
-				podName = strings.TrimSpace(output)
-			}, 2*time.Minute, 5*time.Second).Should(Succeed())
-
-			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "pod", podName,
-					"-n", testNamespace,
-					"-o", "jsonpath={.status.phase}")
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(strings.TrimSpace(output)).To(Equal("Running"))
-			}, 2*time.Minute, 5*time.Second).Should(Succeed())
-
-			By("verifying file content on the node")
-			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "exec", podName,
-					"-c", "file-injector",
-					"-n", testNamespace,
-					"--",
-					"cat", fmt.Sprintf("/host%s", targetPath))
-				output, err := utils.Run(cmd)
-				if err != nil {
-					// Debug logs on failure
-					logCmd := exec.Command("kubectl", "logs", podName, "-c", "file-injector", "-n", testNamespace, "--tail=50")
-					if logs, logErr := utils.Run(logCmd); logErr == nil {
-						fmt.Printf("\n=== Pod logs (last 50 lines) ===\n%s\n", logs)
-					}
-				}
-				g.Expect(err).NotTo(HaveOccurred())
-				if strings.TrimSpace(output) != "initial-content-v1" {
-					fmt.Printf("\n=== Unexpected file content ===\nExpected: 'initial-content-v1'\nGot: '%s'\n", strings.TrimSpace(output))
-				}
-				g.Expect(strings.TrimSpace(output)).To(Equal("initial-content-v1"))
-			}, 1*time.Minute, 5*time.Second).Should(Succeed())
-
-			By("verifying file permissions (0644)")
-			cmd = exec.Command("kubectl", "exec", podName,
-				"-c", "file-injector",
-				"-n", testNamespace,
-				"--",
-				"stat", "-c", "%a", fmt.Sprintf("/host%s", targetPath))
-			output, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(strings.TrimSpace(output)).To(Equal("644"))
-
-			By("verifying file ownership (0:0)")
-			cmd = exec.Command("kubectl", "exec", podName,
-				"-c", "file-injector",
-				"-n", testNamespace,
-				"--",
-				"stat", "-c", "%u:%g", fmt.Sprintf("/host%s", targetPath))
-			output, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(strings.TrimSpace(output)).To(Equal("0:0"))
-
-			By("verifying NodeFileInjector status is Ready")
-			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "nfi", nfiName,
-					"-n", testNamespace,
-					"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
-				output, err := utils.Run(cmd)
-				if err != nil {
-					// Debug: show full NFI status
-					statusCmd := exec.Command("kubectl", "get", "nfi", nfiName, "-n", testNamespace, "-o", "yaml")
-					if statusYaml, statusErr := utils.Run(statusCmd); statusErr == nil {
-						fmt.Printf("\n=== NodeFileInjector status ===\n%s\n", statusYaml)
-					}
-				}
-				g.Expect(err).NotTo(HaveOccurred())
-				if strings.TrimSpace(output) != "True" {
-					fmt.Printf("\n=== NodeFileInjector not Ready ===\nStatus: '%s'\n", strings.TrimSpace(output))
-					// Show conditions
-					condCmd := exec.Command("kubectl", "get", "nfi", nfiName, "-n", testNamespace, "-o", "jsonpath={.status.conditions}")
-					if conditions, condErr := utils.Run(condCmd); condErr == nil {
-						fmt.Printf("Conditions: %s\n", conditions)
-					}
-				}
-				g.Expect(strings.TrimSpace(output)).To(Equal("True"))
-			}, 2*time.Minute, 5*time.Second).Should(Succeed())
-		})
-
-		It("should update file when ConfigMap changes", func() {
-			By("getting the current pod name")
-			cmd := exec.Command("kubectl", "get", "pods",
-				"-l", fmt.Sprintf("app.kubernetes.io/instance=%s", nfiName),
-				"-n", testNamespace,
-				"-o", "jsonpath={.items[0].metadata.name}")
-			podName, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-			podName = strings.TrimSpace(podName)
-			Expect(podName).NotTo(BeEmpty())
-
-			By("updating ConfigMap content")
-			cmd = exec.Command("kubectl", "patch", "configmap", configMap,
-				"-n", testNamespace,
-				"--type=json",
-				"-p", `[{"op": "replace", "path": "/data/config.yaml", "value": "updated-content-v2"}]`)
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("waiting for file content to be updated (Kubernetes ConfigMap sync + script check)")
-			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "exec", podName,
-					"-c", "file-injector",
-					"-n", testNamespace,
-					"--",
-					"cat", fmt.Sprintf("/host%s", targetPath))
-				output, err := utils.Run(cmd)
-				if err != nil {
-					// Debug logs
-					logCmd := exec.Command("kubectl", "logs", podName, "-c", "file-injector", "-n", testNamespace, "--tail=100")
-					if logs, logErr := utils.Run(logCmd); logErr == nil {
-						fmt.Printf("\n=== Pod logs (last 100 lines) ===\n%s\n", logs)
-					}
-					// Check ConfigMap content
-					cmCmd := exec.Command("kubectl", "get", "configmap", "test-nfi-cm", "-n", testNamespace, "-o", "yaml")
-					if cmYaml, cmErr := utils.Run(cmCmd); cmErr == nil {
-						fmt.Printf("\n=== ConfigMap content ===\n%s\n", cmYaml)
-					}
-				}
-				g.Expect(err).NotTo(HaveOccurred())
-				currentContent := strings.TrimSpace(output)
-				if currentContent != "updated-content-v2" {
-					fmt.Printf("\n=== File not yet updated ===\nExpected: 'updated-content-v2'\nGot: '%s'\n", currentContent)
-					// Check mounted volume content
-					srcCmd := exec.Command("kubectl", "exec", podName, "-c", "file-injector", "-n", testNamespace, "--", "cat", "/source/content")
-					if srcContent, srcErr := utils.Run(srcCmd); srcErr == nil {
-						fmt.Printf("Source volume content: '%s'\n", strings.TrimSpace(srcContent))
-					}
-				}
-				g.Expect(currentContent).To(Equal("updated-content-v2"))
-			}, 2*time.Minute, 5*time.Second).Should(Succeed())
-
-			By("verifying backup file was created")
-			cmd = exec.Command("kubectl", "exec", podName,
-				"-c", "file-injector",
-				"-n", testNamespace,
-				"--",
-				"sh", "-c", fmt.Sprintf("ls %s.backup.* 2>/dev/null | wc -l", fmt.Sprintf("/host%s", targetPath)))
-			output, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-			backupCount := strings.TrimSpace(output)
-			Expect(backupCount).NotTo(Equal("0"), "At least one backup file should exist")
-		})
-	})
-
-	Context("Secret-based file injection", func() {
-		const (
-			nfiName    = "test-secret-injection"
-			secretName = "test-nfi-secret"
-			targetPath = "/tmp/test-nfi-secret/token"
-		)
-
-		BeforeAll(func() {
-			By("creating test Secret")
-			cmd := exec.Command("kubectl", "create", "secret", "generic", secretName,
-				"--from-literal=token=secret-token-value",
-				"-n", testNamespace)
-			_, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-		})
-
-		AfterAll(func() {
-			By("cleaning up NodeFileInjector")
-			cmd := exec.Command("kubectl", "delete", "nfi", nfiName,
-				"-n", testNamespace, "--ignore-not-found=true")
-			_, _ = utils.Run(cmd)
-
-			By("cleaning up Secret")
-			cmd = exec.Command("kubectl", "delete", "secret", secretName,
-				"-n", testNamespace, "--ignore-not-found=true")
-			_, _ = utils.Run(cmd)
-		})
-
-		It("should inject file from Secret with restricted permissions", func() {
-			By("creating NodeFileInjector resource with Secret source")
-			nfiYaml := fmt.Sprintf(`
-apiVersion: files.barpilot.io/v1alpha1
-kind: NodeFileInjector
-metadata:
-  name: %s
-  namespace: %s
-spec:
-  path: %s
-  source:
-    secretKeyRef:
-      name: %s
-      key: token
-  mode: "0600"
-  owner: 1000
-  group: 1000
-`, nfiName, testNamespace, targetPath, secretName)
-
-			cmd := exec.Command("kubectl", "apply", "-f", "-")
-			cmd.Stdin = strings.NewReader(nfiYaml)
-			_, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-
-			By("waiting for DaemonSet pod to be running")
-			var podName string
-			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "pods",
-					"-l", fmt.Sprintf("app.kubernetes.io/instance=%s", nfiName),
-					"-n", testNamespace,
-					"-o", "jsonpath={.items[0].metadata.name}")
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				podName = strings.TrimSpace(output)
-				g.Expect(podName).NotTo(BeEmpty())
-			}, 2*time.Minute, 5*time.Second).Should(Succeed())
-
-			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "pod", podName,
-					"-n", testNamespace,
-					"-o", "jsonpath={.status.phase}")
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(strings.TrimSpace(output)).To(Equal("Running"))
-			}, 2*time.Minute, 5*time.Second).Should(Succeed())
-
-			By("verifying file was created with correct content")
-			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "exec", podName,
-					"-c", "file-injector",
-					"-n", testNamespace,
-					"--",
-					"test", "-f", fmt.Sprintf("/host%s", targetPath))
-				_, err := utils.Run(cmd)
-				if err != nil {
-					// Debug logs
-					logCmd := exec.Command("kubectl", "logs", podName, "-c", "file-injector", "-n", testNamespace, "--tail=50")
-					if logs, logErr := utils.Run(logCmd); logErr == nil {
-						fmt.Printf("\n=== Pod logs (last 50 lines) ===\n%s\n", logs)
-					}
-					// Check directory content
-					lsCmd := exec.Command("kubectl", "exec", podName, "-c", "file-injector", "-n", testNamespace, "--", "ls", "-la", "/host/tmp/test-nfi-secret")
-					if lsOutput, lsErr := utils.Run(lsCmd); lsErr == nil {
-						fmt.Printf("\n=== Directory content ===\n%s\n", lsOutput)
-					}
-				}
-				g.Expect(err).NotTo(HaveOccurred())
-			}, 1*time.Minute, 5*time.Second).Should(Succeed())
-
-			By("verifying restrictive file permissions (0600)")
-			cmd = exec.Command("kubectl", "exec", podName,
-				"-c", "file-injector",
-				"-n", testNamespace,
-				"--",
-				"stat", "-c", "%a", fmt.Sprintf("/host%s", targetPath))
-			output, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(strings.TrimSpace(output)).To(Equal("600"))
-
-			By("verifying file ownership (1000:1000)")
-			cmd = exec.Command("kubectl", "exec", podName,
-				"-c", "file-injector",
-				"-n", testNamespace,
-				"--",
-				"stat", "-c", "%u:%g", fmt.Sprintf("/host%s", targetPath))
-			output, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred())
-			Expect(strings.TrimSpace(output)).To(Equal("1000:1000"))
-		})
 	})
 })
 

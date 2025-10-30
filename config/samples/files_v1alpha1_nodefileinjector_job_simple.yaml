@@ -4,12 +4,15 @@ metadata:
   labels:
     app.kubernetes.io/name: node-file-injector
     app.kubernetes.io/managed-by: kustomize
-  name: nodefileinjector-sample
+  name: nodefileinjector-job-simple
 spec:
-  # Node selector to target specific nodes
-  # Leave empty to target all nodes
-  nodeSelector:
-    kubernetes.io/os: linux
+  # Use Job mode for one-time file injection
+  mode: job
+
+  # Simple Job configuration (optional)
+  jobTemplate:
+    # Automatically clean up Jobs after completion
+    ttlSecondsAfterFinished: 300
 
   # Source from a ConfigMap
   source:

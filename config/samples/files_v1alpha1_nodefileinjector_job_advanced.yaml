@@ -1,0 +1,141 @@
+apiVersion: files.barpilot.io/v1alpha1
+kind: NodeFileInjector
+metadata:
+  labels:
+    app.kubernetes.io/name: node-file-injector
+    app.kubernetes.io/managed-by: kustomize
+  name: nodefileinjector-job-advanced
+spec:
+  mode: job
+
+  jobTemplate:
+    ttlSecondsAfterFinished: 300
+    backoffLimit: 3
+    activeDeadlineSeconds: 600
+
+    # Advanced Pod template with full customization
+    template:
+      metadata:
+        labels:
+          environment: production
+          team: platform
+        annotations:
+          prometheus.io/scrape: "false"
+
+      spec:
+        # Run on control-plane nodes with tolerations
+        tolerations:
+          - key: node-role.kubernetes.io/control-plane
+            operator: Exists
+            effect: NoSchedule
+          - key: node.kubernetes.io/disk-pressure
+            operator: Exists
+            effect: NoExecute
+            tolerationSeconds: 300
+
+        # Prefer nodes with SSD storage
+        affinity:
+          nodeAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                preference:
+                  matchExpressions:
+                    - key: disk-type
+                      operator: In
+                      values:
+                        - ssd
+                        - nvme
+              - weight: 50
+                preference:
+                  matchExpressions:
+                    - key: node-role.kubernetes.io/control-plane
+                      operator: Exists
+
+        # Pod-level security context
+        securityContext:
+          fsGroup: 2000
+          seccompProfile:
+            type: RuntimeDefault
+
+        # High priority for system-critical file injection
+        priorityClassName: system-node-critical
+
+        # Use custom service account with specific permissions
+        serviceAccountName: node-file-injector-sa
+
+        # Customize file-injector container
+        containers:
+          - name: file-injector
+            # Custom image with additional tools
+            image: busybox:1.36
+
+            # Higher resource limits for large files
+            resources:
+              requests:
+                cpu: 100m
+                memory: 128Mi
+              limits:
+                cpu: 500m
+                memory: 256Mi
+
+          # Optional: Add monitoring sidecar
+          - name: metrics-exporter
+            image: prom/node-exporter:latest
+            args:
+              - --path.rootfs=/host
+              - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+|var/lib/kubelet/.+)($|/)
+            volumeMounts:
+              - name: host
+                mountPath: /host
+                readOnly: true
+            ports:
+              - name: metrics
+                containerPort: 9100
+            resources:
+              requests:
+                cpu: 10m
+                memory: 32Mi
+              limits:
+                cpu: 50m
+                memory: 64Mi
+
+        # Init container for pre-flight checks
+        initContainers:
+          - name: preflight
+            image: busybox:latest
+            command:
+              - sh
+              - -c
+              - |
+                echo "Checking system requirements..."
+                df -h /host/etc
+                echo "Preflight checks passed"
+            volumeMounts:
+              - name: host
+                mountPath: /host
+                readOnly: true
+
+        # Image pull secrets for private registries
+        imagePullSecrets:
+          - name: regcred
+
+        # Runtime class for specific container runtime
+        runtimeClassName: kata-containers
+
+  # Target only production nodes
+  nodeSelector:
+    environment: production
+    kubernetes.io/os: linux
+
+  # Source from a Secret for sensitive data
+  source:
+    secretKeyRef:
+      name: sensitive-config
+      key: app.key
+
+  path: /etc/myapp/secrets/app.key
+
+  # Restrictive permissions for secrets
+  fileMode: "0600"
+  owner: 1000
+  group: 1000
