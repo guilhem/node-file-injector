@@ -51,13 +51,13 @@ type DeploymentStatus struct {
 }
 
 // NewDeployer creates a deployer based on the deployment mode
-func NewDeployer(mode filesv1alpha1.DeploymentMode, client client.Client, scheme *runtime.Scheme, recorder record.EventRecorder) Deployer {
+func NewDeployer(mode filesv1alpha1.DeploymentMode, c client.Client, scheme *runtime.Scheme, recorder record.EventRecorder) Deployer {
 	switch mode {
 	case filesv1alpha1.DeploymentModeJob:
-		return NewJobDeployer(client, scheme, recorder)
+		return NewJobDeployer(c, scheme, recorder)
 	case filesv1alpha1.DeploymentModeDaemonSet:
 		fallthrough
 	default:
-		return NewDaemonSetDeployer(client, scheme, recorder)
+		return NewDaemonSetDeployer(c, scheme, recorder)
 	}
 }
