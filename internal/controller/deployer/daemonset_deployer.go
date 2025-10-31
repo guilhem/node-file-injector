@@ -56,9 +56,9 @@ type DaemonSetDeployer struct {
 }
 
 // NewDaemonSetDeployer creates a new DaemonSet deployer
-func NewDaemonSetDeployer(client client.Client, scheme *runtime.Scheme, recorder record.EventRecorder) Deployer {
+func NewDaemonSetDeployer(c client.Client, scheme *runtime.Scheme, recorder record.EventRecorder) Deployer {
 	return &DaemonSetDeployer{
-		client:   client,
+		client:   c,
 		scheme:   scheme,
 		recorder: recorder,
 	}

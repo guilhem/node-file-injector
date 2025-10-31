@@ -84,9 +84,9 @@ type JobDeployer struct {
 }
 
 // NewJobDeployer creates a new Job deployer
-func NewJobDeployer(client client.Client, scheme *runtime.Scheme, recorder record.EventRecorder) Deployer {
+func NewJobDeployer(c client.Client, scheme *runtime.Scheme, recorder record.EventRecorder) Deployer {
 	return &JobDeployer{
-		client:   client,
+		client:   c,
 		scheme:   scheme,
 		recorder: recorder,
 	}
@@ -363,7 +363,7 @@ func (j *JobDeployer) buildJob(nfi *filesv1alpha1.NodeFileInjector, nodeName str
 		jobName = fmt.Sprintf("nfi-%s-%s", truncatedName, nodeHash)
 	}
 
-	labels := map[string]string{
+	jobLabels := map[string]string{
 		"app.kubernetes.io/name":       "node-file-injector",
 		"app.kubernetes.io/instance":   nfi.Name,
 		"app.kubernetes.io/component":  "file-injection-job",
@@ -494,7 +494,7 @@ func (j *JobDeployer) buildJob(nfi *filesv1alpha1.NodeFileInjector, nodeName str
 	}
 
 	// Add required labels (user labels take precedence if already set)
-	for k, v := range labels {
+	for k, v := range jobLabels {
 		if _, exists := podTemplate.Labels[k]; !exists {
 			podTemplate.Labels[k] = v
 		}
@@ -606,7 +606,7 @@ func (j *JobDeployer) buildJob(nfi *filesv1alpha1.NodeFileInjector, nodeName str
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        jobName,
 			Namespace:   nfi.Namespace,
-			Labels:      labels,
+			Labels:      jobLabels,
 			Annotations: annotations,
 		},
 		Spec: batchv1.JobSpec{
