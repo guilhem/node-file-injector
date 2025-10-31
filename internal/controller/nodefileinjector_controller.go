@@ -192,6 +192,7 @@ func (r *NodeFileInjectorReconciler) reconcileDelete(ctx context.Context, nfi *f
 	return ctrl.Result{}, nil
 }
 
+// nolint:unparam
 func (r *NodeFileInjectorReconciler) setCondition(nfi *filesv1alpha1.NodeFileInjector, conditionType string, status metav1.ConditionStatus, reason, message string) {
 	condition := metav1.Condition{
 		Type:               conditionType,
