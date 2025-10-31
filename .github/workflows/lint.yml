@@ -18,6 +18,6 @@ jobs:
           go-version-file: go.mod
 
       - name: Run linter
-        uses: golangci/golangci-lint-action@v8
+        uses: guilhem/golangci-lint-action@custom-plugin
         with:
           version: v2.4.0
